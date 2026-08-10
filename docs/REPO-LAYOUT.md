@@ -3,7 +3,11 @@
 ```
 📦 claude-code-local/
  ├── ⚡ proxy/
- │   └── server.py              ← MLX Native Anthropic Server with tool-call recovery (~1000 lines)
+ │   ├── server.py              ← Native Anthropic Server with tool-call recovery (~1000 lines)
+ │   └── backends/
+ │       ├── base.py           ← What a backend has to provide
+ │       ├── mlx_backend.py    ←  Apple Silicon (mlx-lm)
+ │       └── torch_backend.py  ← 🐧 NVIDIA CUDA / AMD ROCm / CPU (transformers)
  ├── 🚀 launchers/
  │   ├── Claude Local.command    ← Default fighter — Claude Code + local model
  │   ├── Gemma 4 Code.command    ← 🟢 THE QUICK ONE
@@ -21,7 +25,8 @@
  │   └── upload-mlx-quant.sh    ← Publish your own MLX-quantized uploads to HF
  ├── 📊 docs/
  │   └── BENCHMARKS.md          ← Detailed speed comparisons
- └── setup.sh                    ← One-command installer
+ ├── setup.sh                    ← One-command installer (macOS, MLX)
+ └── setup-linux.sh              ← One-command installer (Linux, torch)
 ```
 
 ---

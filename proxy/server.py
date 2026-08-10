@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-MLX Native Anthropic Server — Claude Code on Apple Silicon.
+Native Anthropic Server — Claude Code against a local model.
 
-Single-file server: MLX inference + Anthropic Messages API + tool use support.
-Converts Anthropic tool format <-> the model's native function calling format
-(Gemma 4's `<|tool_call>call:Name{...}<tool_call|>`, Llama 3.3's raw-JSON
-`{"type":"function",...}`, and the common HuggingFace `<tool_call>` JSON form
-used by Qwen and others).
+Anthropic Messages API + tool use support, talking straight to a local
+inference engine. Converts Anthropic tool format <-> the model's native
+function calling format (Gemma 4's `<|tool_call>call:Name{...}<tool_call|>`,
+Llama 3.3's raw-JSON `{"type":"function",...}`, and the common HuggingFace
+`<tool_call>` JSON form used by Qwen and others).
 
-Pick a model from the lineup with the MLX_MODEL env var:
-    MLX_MODEL=divinetribe/gemma-4-31b-it-abliterated-4bit-mlx            (THE QUICK ONE — default, our own MLX upload)
-    MLX_MODEL=divinetribe/Llama-3.3-70B-Instruct-abliterated-8bit-mlx    (THE WISE ONE — our own MLX upload)
-    MLX_MODEL=mlx-community/Qwen3.5-122B-A10B-4bit                       (THE BEAST)
+Two backends, selected with LLM_BACKEND=mlx|torch|auto (default auto — MLX on
+Apple Silicon, torch everywhere else):
+
+    mlx    Apple Silicon via mlx-lm
+    torch  NVIDIA CUDA / AMD ROCm / CPU via transformers
+
+Pick a model with LLM_MODEL (MLX_MODEL still works):
+    LLM_MODEL=divinetribe/gemma-4-31b-it-abliterated-4bit-mlx            (mlx — THE QUICK ONE, default)
+    LLM_MODEL=divinetribe/Llama-3.3-70B-Instruct-abliterated-8bit-mlx    (mlx — THE WISE ONE)
+    LLM_MODEL=Qwen/Qwen2.5-Coder-7B-Instruct                             (torch — CUDA)
 
 NOTE FOR CONTRIBUTORS: this file is the source of truth. `setup.sh` installs it
 at `~/.local/mlx-native-server/server.py` via a symlink, so edits here take
@@ -21,7 +27,6 @@ effect on the running server after a restart — no re-copying needed.
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -29,12 +34,10 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx_lm.utils import load
-from mlx_lm.generate import stream_generate
-from mlx_lm.sample_utils import make_sampler
-from mlx_lm.models.cache import make_prompt_cache
+# Resolve through the symlink setup.sh installs, so `backends/` is found next
+# to the real file in the repo rather than in ~/.local/mlx-native-server.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from backends import get_backend, resolve_backend_name  # noqa: E402
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -51,41 +54,20 @@ def env_int(name, default):
     return int(raw) if raw.strip() else default
 
 
-MODEL_PATH = os.environ.get("MLX_MODEL", "divinetribe/gemma-4-31b-it-abliterated-4bit-mlx")
-PORT = env_int("MLX_PORT", 4000)
-KV_BITS = env_int("MLX_KV_BITS", 0)  # Gemma 4 RotatingKVCache doesn't support quantization
-# This used to default to 8192, which quietly TRIPLES peak memory on a long
-# prompt and is the reason a big Claude Code request could take the machine into
-# swap (or straight into the OOM killer on a 32GB Mac) while the model itself
-# fits fine.
+BACKEND_NAME = resolve_backend_name()
+_DEFAULT_MODEL = ("divinetribe/gemma-4-31b-it-abliterated-4bit-mlx" if BACKEND_NAME == "mlx"
+                  else "Qwen/Qwen2.5-Coder-7B-Instruct")
+# LLM_MODEL is the backend-neutral name; MLX_MODEL is kept for every launcher,
+# script and blog post that already sets it.
+MODEL_PATH = os.environ.get("LLM_MODEL") or os.environ.get("MLX_MODEL") or _DEFAULT_MODEL
+PORT = env_int("LLM_PORT", env_int("MLX_PORT", 4000))
+# Prefill chunking, KV quantization and memory caps are engine-specific and
+# live in the backend that implements them (see proxy/backends/).
 #
-# mlx_lm's prefill loop runs the WHOLE model on each chunk, lm_head included, so
-# a single 8192-token chunk allocates an (8192 x vocab) bf16 logits tensor it
-# immediately throws away — 4.3GB at Gemma's 262144 vocab. On top of that the
-# full attention layers score the entire chunk against every key so far. None of
-# it is reused, all of it is live at once.
-#
-# Measured on gemma-4-31b-it-abliterated-4bit-mlx (16.7GB of weights resident),
-# same prompt each time, via mx.get_peak_memory():
-#
-#     prompt    prefill 8192      prefill 1024      prefill 512
-#     21.4k     34.2GB / 49.3s    20.9GB / 37.7s    -      / 39.9s
-#     38.5k     -      / -        23.5GB / 83.1s    21.9GB / 71.0s
-#
-# 17.5GB of transients on a 21k prompt, against 4.2GB for the same work at 512.
-# Small chunks are not slower either — the GPU saturates far below 8192 tokens —
-# so there was never anything being traded away for that memory.
-PREFILL_SIZE = env_int("MLX_PREFILL_SIZE", 512)
-# Ceiling on MLX's buffer recycle pool, which counts toward this process's
-# memory. Measured at 0.0GB on the model above either way, so treat it as a
-# backstop for larger ones (Llama 70B 8-bit) rather than a fix on its own.
-# MLX_CACHE_LIMIT_GB=0 disables the cap.
-MEM_CACHE_LIMIT_GB = float(os.environ.get("MLX_CACHE_LIMIT_GB") or 3)
 # Pre-fill an empty thinking block to skip Gemma 4 reasoning chains entirely.
 # Set MLX_SUPPRESS_THINKING=0 to disable (e.g. when you want reasoning output).
 SUPPRESS_THINKING = os.environ.get("MLX_SUPPRESS_THINKING", "1") == "1"
-DEFAULT_MAX_TOKENS = env_int("MLX_MAX_TOKENS", 8192)
-KV_QUANT_START = env_int("MLX_KV_QUANT_START", 256)
+DEFAULT_MAX_TOKENS = env_int("LLM_MAX_TOKENS", env_int("MLX_MAX_TOKENS", 8192))
 MAX_TOOL_RETRIES = env_int("MLX_TOOL_RETRIES", 2)
 # Browser mode: strip Claude Code bloat, keep only MCP tools
 BROWSER_MODE = os.environ.get("MLX_BROWSER_MODE", "0") == "1"
@@ -95,12 +77,9 @@ CODE_MODE_ENABLED = os.environ.get("MLX_CODE_MODE", "1") != "0"
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 
-model = None
+backend = None  # set by load_model()
 tokenizer = None
 generate_lock = threading.Lock()
-# Prompt cache: reuse KV state across requests to avoid re-prefilling system+tools
-_prompt_cache = None
-_cached_token_prefix = None  # token IDs we've already prefilled
 
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -127,63 +106,17 @@ GEMMA4_CHAT_TEMPLATE = (
     "{% if add_generation_prompt %}<|turn>model\n{% endif %}"
 )
 
-GB = 1024 ** 3
-
-
 def mem_snapshot():
-    """What this process is actually holding, in GB.
-
-    Watch mx_peak, not rss. `ps rss` cannot see Metal buffers — it reported a
-    flat 16.7GB straight through a prefill that MLX itself measured at 34GB, so
-    a server can be moments from swapping while every RSS reading looks calm.
-    Activity Monitor's "Memory" column (phys_footprint) does see them.
-    """
-    try:
-        rss = psutil_rss_gb()
-    except Exception:
-        rss = 0.0
-    return {
-        "rss_gb": round(rss, 1),
-        "mx_active_gb": round(mx.get_active_memory() / GB, 1),
-        "mx_cache_gb": round(mx.get_cache_memory() / GB, 1),
-        "mx_peak_gb": round(mx.get_peak_memory() / GB, 1),
-    }
-
-
-def psutil_rss_gb():
-    """RSS without a psutil dependency — the mlx venv doesn't ship one."""
-    out = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
-                         capture_output=True, text=True).stdout.strip()
-    return int(out) / 1024 / 1024 if out else 0.0
-
-
-def release_transients(tag=""):
-    """Hand MLX's recycle pool back after every generation, and log the peak.
-
-    The log line is half the point. When a memory death happens there is no
-    traceback and usually no crash report, because the process is killed from
-    outside — so a per-request peak, written down while the server was still
-    alive, is the only thing that distinguishes "that prompt was too big" from
-    any other silent exit. On a 31B 4-bit the pool itself measures 0.0GB, so the
-    clear_cache is insurance for models that do accumulate one.
-    """
-    before = mx.get_cache_memory() / GB
-    peak = mx.get_peak_memory() / GB
-    mx.clear_cache()
-    log(f"  Memory{tag}: peak {peak:.1f}GB this request, "
-        f"released {before:.1f}GB of buffer cache, rss now {psutil_rss_gb():.1f}GB")
-    mx.reset_peak_memory()
+    """What this process is actually holding, in GB — backend-specific."""
+    return backend.mem_snapshot() if backend else {}
 
 
 def load_model():
-    global model, tokenizer, KV_BITS
-    if MEM_CACHE_LIMIT_GB > 0:
-        mx.set_cache_limit(int(MEM_CACHE_LIMIT_GB * GB))
-        log(f"MLX buffer cache capped at {MEM_CACHE_LIMIT_GB:g}GB")
-    log(f"Loading model: {MODEL_PATH}")
-    t0 = time.time()
-    model, tokenizer = load(MODEL_PATH)
-    mx.eval(model.parameters())
+    global backend, tokenizer
+    backend = get_backend(log=log)
+    log(f"Backend: {backend.name}")
+    tokenizer = backend.load(MODEL_PATH)
+
     # Fallback chat template if model doesn't provide one (Llama 3.3 has its own)
     if not getattr(tokenizer, 'chat_template', None):
         tokenizer.chat_template = GEMMA4_CHAT_TEMPLATE
@@ -203,24 +136,13 @@ def load_model():
     # is never a legitimate mid-sequence token.
     _tok_eos = getattr(tokenizer, "eos_token_id", None)
     if _tok_eos is not None:
-        _stop_set = set(getattr(tokenizer, "eos_token_ids", None) or set())
+        # mlx-lm exposes a set here; a plain HuggingFace tokenizer can expose a
+        # single int (or nothing at all).
+        _existing = getattr(tokenizer, "eos_token_ids", None) or set()
+        _stop_set = {_existing} if isinstance(_existing, int) else set(_existing)
         if _tok_eos not in _stop_set:
             tokenizer.eos_token_ids = _stop_set | {_tok_eos}
             log(f"Added eos_token_id {_tok_eos} to stop set (was {_stop_set or set()})")
-
-    elapsed = time.time() - t0
-    log(f"Model loaded in {elapsed:.1f}s")
-
-    # Safety net: Gemma uses sliding-window attention → RotatingKVCache, which
-    # mlx-lm can't quantize yet ("RotatingKVCache Quantization NYI"). The
-    # default for MLX_KV_BITS is already 0, but if a user explicitly sets it to
-    # 8 and happens to be running Gemma, auto-disable it so inference doesn't
-    # 500 on the first call. (Credit: asdmoment, PR #7.)
-    if KV_BITS and "gemma" in MODEL_PATH.lower():
-        log("Gemma detected: disabling KV cache quantization (RotatingKVCache NYI)")
-        KV_BITS = 0
-
-    log(f"KV cache quantization: {KV_BITS}-bit" if KV_BITS else "KV cache: full precision")
 
 
 # ─── Think Tag Stripping ────────────────────────────────────────────────────
@@ -833,6 +755,15 @@ def convert_messages(body):
     return messages
 
 
+def _ids(templated):
+    """apply_chat_template returns a plain id list on mlx-lm's tokenizer and a
+    BatchEncoding on a recent HuggingFace one. Both mean the same thing."""
+    if hasattr(templated, "get") and "input_ids" in templated:
+        ids = templated["input_ids"]
+        return list(ids[0]) if ids and isinstance(ids[0], (list, tuple)) else list(ids)
+    return templated
+
+
 def tokenize_messages(messages, tools=None):
     """Apply chat template and tokenize, with optional tool definitions."""
     kwargs = {
@@ -843,7 +774,7 @@ def tokenize_messages(messages, tools=None):
         kwargs["tools"] = tools
 
     try:
-        token_ids = tokenizer.apply_chat_template(messages, **kwargs)
+        token_ids = _ids(tokenizer.apply_chat_template(messages, **kwargs))
         if tools:
             log(f"  Tools: {len(tools)} tools passed via chat template")
         return token_ids
@@ -859,9 +790,9 @@ def tokenize_messages(messages, tools=None):
                 msg_copy.insert(0, {"role": "system", "content": tool_text})
 
             try:
-                return tokenizer.apply_chat_template(
+                return _ids(tokenizer.apply_chat_template(
                     msg_copy, add_generation_prompt=True, tokenize=True
-                )
+                ))
             except Exception:
                 pass
 
@@ -1037,7 +968,7 @@ def count_prompt_tokens(body):
 
 
 def generate_response(body, on_start=None, on_text=None):
-    """Run MLX inference and return Anthropic-formatted response.
+    """Run inference on the active backend and return an Anthropic response.
 
     on_start(prompt_tokens) / on_text(chunk) are optional live-streaming
     hooks (issue #39): on_start fires once right before generation begins,
@@ -1088,7 +1019,7 @@ def generate_response(body, on_start=None, on_text=None):
         sys_text = sys_prompt if isinstance(sys_prompt, str) else str(sys_prompt)[:500]
         log(f"  [FIRST REQUEST] system_start={sys_text[:300]}")
 
-    # Convert tools from Anthropic → MLX format
+    # Convert tools from Anthropic → the model's function-calling format
     anthropic_tools = body.get("tools", [])
     llm_tools = convert_tools_for_llm(anthropic_tools) if anthropic_tools else None
 
@@ -1113,74 +1044,9 @@ def generate_response(body, on_start=None, on_text=None):
     log(f"  Prompt: {prompt_tokens} tokens")
 
     # ─── Prompt cache: reuse KV for shared prefix tokens ───
-    global _prompt_cache, _cached_token_prefix
-
-    # Check if cache type supports safe trim+reuse (standard KVCache only,
-    # RotatingKVCache from Gemma 4 has a circular buffer that breaks on trim+extend)
-    from mlx_lm.models.cache import RotatingKVCache
-    cache_is_safe = _prompt_cache is not None and not isinstance(_prompt_cache[0], RotatingKVCache)
-
-    # Find how many leading tokens match the previous request's prompt
-    cache_hit_len = 0
-    if cache_is_safe and _cached_token_prefix is not None:
-        max_check = min(len(token_ids), len(_cached_token_prefix))
-        for i in range(max_check):
-            if token_ids[i] == _cached_token_prefix[i]:
-                cache_hit_len = i + 1
-            else:
-                break
-
-    # Always leave at least 1 token to prefill — mlx_lm.stream_generate raises
-    # ValueError if the prompt is empty (happens when new prompt == cached prefix)
-    if cache_hit_len >= len(token_ids):
-        cache_hit_len = len(token_ids) - 1
-
-    # .offset is the live token count; .step is a fixed 256-token allocation
-    # increment. Reading .step made trim_amount negative for any prefix longer
-    # than 256 tokens, so the trim never ran and the cache kept the previous
-    # session's KV state (issue #46). Caches without .offset can't be trimmed
-    # safely at all, so fall through to a full prefill instead of guessing.
-    cache_offset = getattr(_prompt_cache[0], "offset", None) if _prompt_cache else None
-    if cache_hit_len > 0 and cache_offset is None:
-        log("  Cache has no offset (untrimmable type) — full prefill")
-        cache_hit_len = 0
-
-    if cache_hit_len > 0:
-        # Trim cache back to the shared prefix, then only prefill the delta
-        trim_amount = cache_offset - cache_hit_len
-        if trim_amount > 0:
-            for c in _prompt_cache:
-                c.trim(trim_amount)
-        delta_tokens = token_ids[cache_hit_len:]
-        new_tokens = len(delta_tokens)
-        log(f"  Cache hit: {cache_hit_len} reused, {new_tokens} new tokens to prefill (saved {cache_hit_len} tokens)")
-        # Feed only the new tokens, with the existing cache
-        prompt_for_gen = delta_tokens
-    else:
-        if _prompt_cache is not None and isinstance(_prompt_cache[0], RotatingKVCache):
-            log(f"  RotatingKVCache: fresh cache each request (no trim support)")
-        else:
-            log(f"  Cache miss: full prefill of {prompt_tokens} tokens")
-        _prompt_cache = None
-        prompt_for_gen = token_ids
-
-    # Build generation kwargs — always pass a prompt_cache so we can reuse it
-    if _prompt_cache is None:
-        _prompt_cache = make_prompt_cache(model)
-        log(f"  Created new prompt cache ({len(_prompt_cache)} layers)")
-    gen_kwargs = {
-        "prefill_step_size": PREFILL_SIZE,
-        "prompt_cache": _prompt_cache,
-    }
-    if KV_BITS:
-        gen_kwargs["kv_bits"] = KV_BITS
-        gen_kwargs["kv_group_size"] = 64
-        gen_kwargs["quantized_kv_start"] = KV_QUANT_START
-
-    if temperature > 0:
-        gen_kwargs["sampler"] = make_sampler(temp=temperature)
-    else:
-        gen_kwargs["sampler"] = make_sampler(temp=0.0)
+    # The backend trims its cache to the prefix this prompt shares with the
+    # last one and returns whatever still has to be prefilled.
+    prompt_for_gen, cache_hit_len = backend.prepare_prompt(token_ids)
 
     # Generate — ThinkingFilter removes Gemma 4 thinking blocks in real-time
     # so clean_response never sees them (more robust than regex post-hoc).
@@ -1195,13 +1061,7 @@ def generate_response(body, on_start=None, on_text=None):
 
     with generate_lock:
         try:
-            for response in stream_generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt_for_gen,
-                max_tokens=max_tokens,
-                **gen_kwargs,
-            ):
+            for response in backend.stream(prompt_for_gen, max_tokens, temperature):
                 chunk = tf.feed(response.text)
                 full_text += chunk
                 if on_text and chunk:
@@ -1216,15 +1076,12 @@ def generate_response(body, on_start=None, on_text=None):
             # error handler) runs. In a finally so a failed generation cannot
             # leave the pool inflated and get us evicted for memory we are no
             # longer using.
-            release_transients()
+            backend.release_transients()
 
     _tail = tf.flush()
     full_text += _tail
     if on_text and _tail:
         on_text(_tail)
-
-    # Cache is updated in-place by MLX — save the token prefix for next request's diff
-    _cached_token_prefix = token_ids
 
     # An empty completion straight after a cache hit is almost always corrupt
     # KV state, not a real answer. Say so, and drop the cache so the next
@@ -1232,8 +1089,7 @@ def generate_response(body, on_start=None, on_text=None):
     if cache_hit_len > 0 and not full_text.strip():
         log(f"  WARNING: empty completion after a {cache_hit_len}-token cache hit "
             f"— discarding prompt cache (see issue #46)")
-        _prompt_cache = None
-        _cached_token_prefix = None
+        backend.reset_cache()
 
     elapsed = time.time() - t0
     tps = gen_tokens / elapsed if elapsed > 0 else 0
@@ -1274,10 +1130,7 @@ def generate_response(body, on_start=None, on_text=None):
             retry_gen = 0
             retry_tf = ThinkingFilter()
             with generate_lock:
-                for response in stream_generate(
-                    model=model, tokenizer=tokenizer, prompt=retry_tokens,
-                    max_tokens=max_tokens, **gen_kwargs,
-                ):
+                for response in backend.stream(retry_tokens, max_tokens, temperature):
                     retry_text += retry_tf.feed(response.text)
                     retry_gen = response.generation_tokens
             retry_text += retry_tf.flush()
@@ -1714,7 +1567,8 @@ class AnthropicHandler(BaseHTTPRequestHandler):
             # to the edge is this box?" without attaching to the process.
             # mx_peak_gb is the honest one; see mem_snapshot on why not rss.
             payload = {"status": "ok", "model": MODEL_PATH,
-                       "prefill_size": PREFILL_SIZE}
+                       "backend": backend.name if backend else BACKEND_NAME,
+                       "device": backend.device_label if backend else "?"}
             payload.update(mem_snapshot())
             send_json(self, 200, payload)
         else:
@@ -1725,8 +1579,8 @@ class AnthropicHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print("╔══════════════════════════════════════════════════╗")
-    print("║  MLX Native Anthropic Server                    ║")
-    print("║  Claude Code → MLX → Apple Silicon (direct)     ║")
+    print("║  Native Anthropic Server                        ║")
+    print("║" + f"  Claude Code → {BACKEND_NAME} → local model".ljust(50) + "║")
     print("║  Tool use: enabled (Anthropic ↔ Llama native)   ║")
     print("║  Prompt caching: enabled (KV reuse)             ║")
     print("╚══════════════════════════════════════════════════╝")
@@ -1737,11 +1591,8 @@ if __name__ == "__main__":
     print()
     print(f"Serving Anthropic Messages API on http://localhost:{PORT}")
     print(f"Model: {MODEL_PATH}")
-    print(f"KV cache: {KV_BITS}-bit quantization (start at token {KV_QUANT_START})" if KV_BITS else "KV cache: full precision")
-    print(f"Prefill chunk: {PREFILL_SIZE} tokens"
-          + (f" · MLX buffer cache capped at {MEM_CACHE_LIMIT_GB:g}GB" if MEM_CACHE_LIMIT_GB > 0 else ""))
+    print(f"Backend: {backend.name} on {backend.device_label}")
     print(f"Memory now: {mem_snapshot()}")
-    print(f"Prompt cache: enabled (KV reuse across requests)")
     print(f"Tool retry: up to {MAX_TOOL_RETRIES} retries on garbled tool calls")
     print()
     print("Claude Code config:")

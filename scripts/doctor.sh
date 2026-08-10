@@ -29,6 +29,14 @@ echo "${C_CYAN}╚════════════════════�
 echo ""
 
 # ── Apple Silicon check ───────────────────────────────────────
+if [[ $(uname -s) == "Linux" ]]; then
+  err "This doctor reports on the MLX (Apple Silicon) install."
+  info "On Linux the server runs on the torch backend instead:"
+  info "  bash setup-linux.sh          # picks a model for your GPU"
+  info "  see docs/LINUX-CUDA.md"
+  exit 1
+fi
+
 if [[ $(uname -m) != "arm64" ]]; then
   err "This requires Apple Silicon (M1 or later)."
   err "Detected architecture: $(uname -m)"
