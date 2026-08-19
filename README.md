@@ -202,6 +202,18 @@ Also need:
 - 🐍 **Python 3.12+** (for MLX)
 - 🤖 **Claude Code** (`npm install -g @anthropic-ai/claude-code`)
 
+### 🐧 Not on a Mac?
+
+MLX is Apple-only; the server isn't. `LLM_BACKEND=torch` runs the same thing on
+NVIDIA CUDA, AMD ROCm, or a bare CPU:
+
+```bash
+bash setup-linux.sh      # detects your GPU, sizes the model to your VRAM
+claude-local             # boots the server, then runs Claude Code
+```
+
+Full guide: **[docs/LINUX-CUDA.md](docs/LINUX-CUDA.md)**.
+
 ---
 
 ## 🚀 Quick Start (One Command)
@@ -218,7 +230,7 @@ cd claude-code-local
 bash setup.sh
 ```
 
-`setup.sh` auto-detects your RAM, picks a model from the lineup, downloads it, installs the MLX server, and creates a `Claude Local.command` launcher on your Desktop.
+`setup.sh` auto-detects your RAM, picks a model from the lineup, downloads it, installs the MLX server, and creates a `Claude Local.command` launcher on your Desktop. (On Linux, `install.sh` hands off to `setup-linux.sh` instead — see [docs/LINUX-CUDA.md](docs/LINUX-CUDA.md).)
 
 **Then double-click `Claude Local.command`.** You're coding locally.
 
@@ -244,6 +256,16 @@ MLX_MODEL=divinetribe/gemma-4-31b-it-abliterated-4bit-mlx \
 ANTHROPIC_BASE_URL=http://localhost:4000 \
 ANTHROPIC_API_KEY=sk-local \
 claude --model claude-sonnet-4-6
+```
+
+On Linux the same three steps, with the torch backend:
+
+```bash
+python3 -m venv ~/.local/llm-server
+~/.local/llm-server/bin/pip install torch transformers accelerate bitsandbytes
+
+LLM_BACKEND=torch LLM_MODEL=Qwen/Qwen2.5-Coder-14B-Instruct LLM_LOAD_IN_4BIT=1 \
+  ~/.local/llm-server/bin/python proxy/server.py
 ```
 
 ---
